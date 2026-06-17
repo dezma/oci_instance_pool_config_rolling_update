@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # OCI instance-pool rolling replacement controller.
-# Version: v13
+# Version: v1.3
 #
 # Purpose:
 #   Replace instance-pool members with instances created from a new instance

@@ -462,6 +462,3 @@ Run cleanup-only mode if the backend sets are dedicated to this pool:
 
 ---
 
-## License
-
-
