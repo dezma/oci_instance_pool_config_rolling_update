@@ -15,7 +15,7 @@ SCRIPT_VERSION="v4"
 usage() {
   cat <<'USAGE'
 Usage:
-  inst-config-update-v4-multi-lb-safe.sh [options]
+  inst-config-update.sh [options]
 
 Required for rollout:
   --new-instance-config-id <ocid>    New instance configuration OCID to apply to the pool.
@@ -52,7 +52,7 @@ Optional:
 
 Examples:
   # Recommended for a pool with multiple LB backend-set attachments:
-  ./inst-config-update-v4-multi-lb-safe.sh \
+  ./inst-config-update.sh \
     --no-env-file \
     --new-instance-config-id ocid1.instanceconfiguration.oc1..example \
     --compartment-id ocid1.compartment.oc1..example \
@@ -64,14 +64,14 @@ Examples:
     --reset-rollout-state
 
   # Cleanup stale backends across every backend set attached to the pool:
-  ./inst-config-update-v4-multi-lb-safe.sh \
+  ./inst-config-update.sh \
     --cleanup-stale-backends-only \
     --compartment-id ocid1.compartment.oc1..example \
     --instance-pool-id ocid1.instancepool.oc1..example \
     --all-attached-backends
 
   # Single backend-set mode, compatible with older script usage:
-  ./inst-config-update-v4-multi-lb-safe.sh \
+  ./inst-config-update.sh \
     --new-instance-config-id ocid1.instanceconfiguration.oc1..example \
     --compartment-id ocid1.compartment.oc1..example \
     --instance-pool-id ocid1.instancepool.oc1..example \
