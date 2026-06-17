@@ -1,577 +1,603 @@
-# OCI Instance Pool Rolling Instance Configuration Update
+# OCI Instance Pool Rolling Update Controller
 
-`inst-config-update.sh ` performs a safe rolling replacement of OCI Compute instance pool members after you point the pool at a new instance configuration.
+A Bash controller for rolling an Oracle Cloud Infrastructure (OCI) instance pool to a new instance configuration while avoiding the `detachInstance` API path.
 
-It is intended for instance pools behind an **OCI Load Balancer**, including pools attached to **multiple backend sets** and backend ports.
+The script is designed for OCI instance pools that are attached to an OCI Load Balancer. It updates the pool to a new instance configuration, creates replacement capacity, verifies the exact replacement VM is healthy in the load balancer, drains the old VM, terminates the old VM directly, restores the pool to the desired steady size, and removes old load balancer backend entries.
 
-The recommended mode is:
+> Script: `inst-config-update.sh`
+>
+> Version: `2026-06-17-v13-no-detach-controller`
+
+---
+
+## Why this script exists
+
+OCI instance pools do not automatically update already-running instances when the pool is pointed to a new instance configuration. Updating the pool changes what future instances are created from; existing VMs must still be replaced.
+
+The usual clean replacement path is to detach old pool members with auto-termination. In some environments, the OCI Compute Management detach operation can repeatedly return a service-side `500 InternalError` for pool members. This script avoids that recurring failure path by **not calling**:
 
 ```bash
---all-attached-backends --replacement-method detach
+oci compute-management instance-pool-instance detach
 ```
 
-That mode lets the script read all load balancer attachments from the instance pool and handle every attached backend set/port during drain and cleanup.
+Instead, it uses a controlled no-detach workflow:
+
+```text
+surge capacity -> verify exact replacement VM health -> drain old backend -> terminate old compute instance -> scale pool back -> delete stale backend entries
+```
+
+This is a workaround for environments where `detachInstance` is unreliable. If the native detach workflow works reliably in your tenancy, it is generally the cleaner OCI-managed path.
 
 ---
 
 ## What the script does
 
-The script does **not** patch existing VMs in place. Instead, it replaces them safely.
-
-At a high level, it does this:
+For each old VM selected for replacement, the script performs this sequence:
 
 ```text
-1. Validate the new instance configuration.
-2. Discover load balancer backend attachments.
-3. Capture only valid active pool members as the old VMs to replace.
-4. Update the instance pool to the new instance configuration.
-5. Temporarily scale the pool up by SURGE_BY.
-6. Wait for new VMs and load balancer backends to become healthy.
-7. Drain the old VM from every selected backend set.
-8. Wait for the drain window.
-9. Detach and auto-terminate the old VM.
-10. Delete old backend entries from every selected backend set.
-11. Verify the pool and all selected backend sets are healthy.
-12. Repeat until every original VM has been replaced.
+1. Discover load balancer backend attachments.
+2. Update the instance pool to the new instance configuration.
+3. Capture valid old pool targets.
+4. Scale the pool from steady size N to N + surge.
+5. Identify the exact replacement instance created by the surge.
+6. Wait until that exact replacement VM is healthy in every selected backend set.
+7. Drain the old VM's backend entries.
+8. Wait the configured drain period.
+9. Terminate the old VM directly with OCI Compute.
+10. Restore the pool target size to the desired steady size.
+11. Delete old backend entries from every selected backend set.
+12. Verify the replacement backend remains healthy.
+13. Save local rollout state so interrupted runs can be resumed.
 ```
 
-Example with a pool of size `2` and `--surge-by 1`:
-
-```text
-Initial:
-  old-vm-1
-  old-vm-2
-
-Step 1:
-  scale pool to 3
-  wait for new-vm-1 healthy
-  drain old-vm-1
-  detach and terminate old-vm-1
-  delete old-vm-1 backend entries
-  pool returns to 2
-
-Step 2:
-  scale pool to 3
-  wait for new-vm-2 healthy
-  drain old-vm-2
-  detach and terminate old-vm-2
-  delete old-vm-2 backend entries
-  pool returns to 2
-
-Final:
-  new-vm-1
-  new-vm-2
-```
+The script intentionally filters out stale pool records by checking the real Compute instance state and attached VNICs. It only treats a pool member as valid if the instance exists, is `RUNNING`, and has a resolvable private IP.
 
 ---
 
-## Why this version exists
+## Key safety behavior
 
-This version addresses rollout issues that can happen with OCI instance pools behind load balancers:
+### It does not require the old VM to be healthy
 
-| Issue | How this script handles it |
-|---|---|
-| Pool is attached to multiple backend sets | `--all-attached-backends` discovers every attached backend set and port from the instance pool. |
-| Old terminated VMs remain on the LB as `Critical - Connection failed` | Old backend entries are deleted from every selected backend set after drain. |
-| Stale pool entries appear in `instance-pool list-instances` | The script captures only instances that still exist in Compute, are active, and have an attached VNIC/private IP. |
-| Direct VM termination can leave dirty pool membership | The default is `--replacement-method detach`, which uses the instance-pool detach workflow. |
-| Rollout fails halfway | The script keeps rollout state and can resume without recapturing already-completed instances. |
-| Existing stale LB backends need cleanup | `--cleanup-stale-backends-only` removes orphaned backend entries without doing a rollout. |
+The old VM may already be degraded before the script starts:
+
+```text
+Critical - Connection failed
+Drained
+Missing from one backend set
+Unhealthy in the load balancer
+```
+
+That is allowed. The old VM is the thing being replaced.
+
+### It does require the new replacement VM to be healthy
+
+Before the script drains or terminates the old VM, the exact replacement VM created during the current surge cycle must be:
+
+```text
+RUNNING
+registered in every selected backend set
+backend health status OK
+not drained
+not offline
+OK for the configured number of consecutive checks
+```
+
+This prevents the dangerous case where an old healthy VM is drained while the new VM is still `Critical`.
+
+### It handles multiple backend sets
+
+With `--all-attached-backends`, the script discovers every `ATTACHED` load balancer backend set from the instance pool and handles each backend set/port during readiness checks, drain, and cleanup.
+
+Example pool attachments:
+
+```text
+backend-set-a : 8080
+backend-set-b : 2080
+backend-set-c : 9080
+```
+
+The old VM backend is drained and removed from all selected backend sets, not just one.
+
+---
+
+## Important design choice: no detach
+
+This v13 script never calls:
+
+```bash
+oci compute-management instance-pool-instance detach
+```
+
+Instead, it directly terminates old instances with:
+
+```bash
+oci compute instance terminate
+```
+
+By default, the script uses:
+
+```bash
+--preserve-boot-volume false
+```
+
+That means old instance boot volumes are deleted unless you explicitly pass:
+
+```bash
+--preserve-boot-volume true
+```
+
+Because this script avoids instance-pool detach, OCI can sometimes still show historical, terminated, or stale pool-member records for a period of time. The script accounts for that by filtering pool list output using real Compute instance state and VNIC checks.
+
+If a terminated or not-found instance remains visible as a pool member for a long time, open an OCI Support Request and include the affected instance pool OCID, stale instance OCIDs, and any failed `detachInstance` `opc-request-id` values.
 
 ---
 
 ## Requirements
 
-Install and configure:
+### Local tools
+
+Install these before running the script:
 
 ```text
 bash
-oci CLI
+oci
 jq
+awk
 sort
-mktemp
+comm
 ```
 
 Check locally:
 
 ```bash
+bash --version
 oci --version
 jq --version
 ```
 
-Your OCI identity must have permissions to manage or inspect:
+Validate the script syntax:
+
+```bash
+bash -n ./inst-config-update.sh
+```
+
+Check the script version:
+
+```bash
+./inst-config-update.sh --version
+```
+
+Expected:
 
 ```text
-Compute instances
-Compute instance pools
-Instance configurations
-VNIC attachments and VNICs
-Load balancers, backend sets, and backends
+2026-06-17-v13-no-detach-controller
 ```
+
+### OCI setup
+
+You need:
+
+```text
+An OCI instance pool
+A new instance configuration OCID
+An OCI Load Balancer attached to the instance pool
+Backend health checks that accurately detect application readiness
+Enough service limits and capacity for N + surge instances
+IAM permissions to manage compute instances, instance pools, VNICs, and load balancer backends
+```
+
+### Backend/VNIC assumption
+
+The script resolves the backend IP using the instance's primary private IP. It is intended for instance pool load balancer attachments that use:
+
+```text
+PrimaryVnic
+```
+
+If your pool attachment uses a secondary VNIC selection, modify the script before use. The v13 script discovers backend set names and ports, but it does not currently resolve secondary VNIC display-name selections.
 
 ---
 
-## Required OCI resources
+## Recommended usage
 
-Before using the script, you need:
+### Multi-backend rollout
 
-```text
-1. An existing OCI Compute instance pool.
-2. A new instance configuration OCID.
-3. One or more OCI Load Balancer backend sets attached to the instance pool.
-4. A currently healthy application/backend set state.
-5. Enough OCI capacity and limits to temporarily surge the pool.
-```
-
-The script does **not** create a new image or instance configuration. Create the new instance configuration first, then pass its OCID to this script.
-
----
-
-## Important safety notes
-
-### Use cleanup mode only with dedicated backend sets
-
-`--cleanup-stale-backends-only`, `--pre-clean-stale-backends true`, and `--post-clean-stale-backends true` delete backend entries that do not map to active pool members.
-
-That is safe only if the selected backend sets are dedicated to this instance pool.
-
-Do not use broad cleanup if a backend set also contains manually added servers, blue/green targets, shared targets, or non-pool backends that should remain.
-
-### Prefer detach mode
-
-The recommended replacement mode is:
+Use this when the instance pool is attached to one or more load balancer backend sets and you want the script to discover them automatically.
 
 ```bash
---replacement-method detach
-```
+chmod +x ./inst-config-update.sh
 
-Detach mode uses:
-
-```bash
-oci compute-management instance-pool-instance detach \
-  --is-auto-terminate true \
-  --is-decrement-size true
-```
-
-That means:
-
-```text
-Detach the old instance from the pool.
-Terminate/delete the old instance and boot volume.
-Decrease the pool target size after the temporary surge.
-```
-
-### Terminate mode is only a workaround
-
-The script supports:
-
-```bash
---replacement-method terminate
-```
-
-This directly calls Compute instance termination and then restores the pool target size.
-
-Use it only if the instance-pool detach API is temporarily failing and you understand the tradeoff. Direct termination can leave stale pool membership or stale load balancer backend entries depending on OCI convergence behavior.
-
-### Do not reset state when resuming
-
-Use `--reset-rollout-state` only for a fresh rollout.
-
-Do not use it when resuming a failed or partially completed rollout.
-
----
-
-## Quick start
-
-### 1. Make the script executable
-
-```bash
-chmod +x ./inst-config-update.sh 
-```
-
-### 2. Optional: clean stale LB backends first
-
-Run this if previous runs left terminated or missing VMs on the load balancer as `Critical - Connection failed`.
-
-```bash
-./inst-config-update.sh \
-  --cleanup-stale-backends-only \
-  --no-env-file \
-  --compartment-id "ocid1.compartment.oc1..example" \
-  --instance-pool-id "ocid1.instancepool.oc1..example" \
-  --all-attached-backends
-```
-
-### 3. Run the rolling update
-
-```bash
 ./inst-config-update.sh \
   --no-env-file \
-  --new-instance-config-id "ocid1.instanceconfiguration.oc1..example" \
-  --compartment-id "ocid1.compartment.oc1..example" \
-  --instance-pool-id "ocid1.instancepool.oc1..example" \
+  --new-instance-config-id "$NEW_INSTANCE_CONFIG_ID" \
+  --compartment-id "$COMPARTMENT_ID" \
+  --instance-pool-id "$INSTANCE_POOL_ID" \
   --all-attached-backends \
+  --steady-size 1 \
   --surge-by 1 \
   --drain-seconds 120 \
-  --replacement-method detach \
+  --healthy-consecutive-checks 2 \
   --reset-rollout-state
 ```
 
----
+Change `--steady-size` to your desired final pool target size.
 
-## Recommended command for multi-backend pools
+For example:
 
-Use this when the instance pool is attached to multiple backend sets or ports.
+```text
+Current desired pool size: 3
+Surge by: 1
+Temporary rollout size: 4
+Final pool size after each old VM is removed: 3
+```
+
+Use:
 
 ```bash
-./inst-config-update.sh \
-  --no-env-file \
-  --new-instance-config-id "ocid1.instanceconfiguration.oc1..example" \
-  --compartment-id "ocid1.compartment.oc1..example" \
-  --instance-pool-id "ocid1.instancepool.oc1..example" \
-  --all-attached-backends \
-  --surge-by 1 \
-  --drain-seconds 120 \
-  --replacement-method detach \
-  --reset-rollout-state
-```
-
-With `--all-attached-backends`, you do **not** need to pass:
-
-```text
---lb-id
---backend-set-name
---app-port
-```
-
-The script reads the pool's load balancer attachments and discovers the load balancer OCID, backend set name, port, and VNIC selection stored on the pool.
-
----
-
-## Cleanup-only mode
-
-Use cleanup-only mode to remove stale LB backend entries without changing the pool's instance configuration and without replacing VMs.
-
-```bash
-./inst-config-update.sh \
-  --cleanup-stale-backends-only \
-  --no-env-file \
-  --compartment-id "ocid1.compartment.oc1..example" \
-  --instance-pool-id "ocid1.instancepool.oc1..example" \
-  --all-attached-backends
-```
-
-Cleanup-only mode does this:
-
-```text
-1. Discover selected backend sets and ports.
-2. Build a list of active private IPs from valid active pool members.
-3. Keep backend entries that match active pool private IPs.
-4. Delete backend entries that do not match active pool private IPs.
-5. Wait for selected backend sets to return to OK.
-```
-
-Example using placeholders:
-
-```text
-Active pool private IPs:
-  <active-private-ip>
-
-Selected backend sets:
-  web-backend-set:<web-port>
-  api-backend-set:<api-port>
-
-Kept:
-  <active-private-ip>:<web-port>
-  <active-private-ip>:<api-port>
-
-Deleted:
-  <stale-private-ip>:<web-port>
-  <stale-private-ip>:<api-port>
+--steady-size 3 --surge-by 1
 ```
 
 ---
 
-## Single-backend mode
+## Single-backend rollout
 
-Use this when you intentionally want to handle only one backend set and one backend port.
+Use this when you do not want automatic discovery and want to target one specific backend set/port.
 
 ```bash
 ./inst-config-update.sh \
   --no-env-file \
-  --new-instance-config-id "ocid1.instanceconfiguration.oc1..example" \
-  --compartment-id "ocid1.compartment.oc1..example" \
-  --instance-pool-id "ocid1.instancepool.oc1..example" \
-  --lb-id "ocid1.loadbalancer.oc1..example" \
-  --backend-set-name "example-backend-set" \
+  --new-instance-config-id "$NEW_INSTANCE_CONFIG_ID" \
+  --compartment-id "$COMPARTMENT_ID" \
+  --instance-pool-id "$INSTANCE_POOL_ID" \
+  --lb-id "$LB_ID" \
+  --backend-set-name "<backend-set-name>" \
   --app-port 8080 \
+  --steady-size 1 \
   --surge-by 1 \
   --drain-seconds 120 \
-  --replacement-method detach \
+  --healthy-consecutive-checks 2 \
   --reset-rollout-state
 ```
 
-Single-backend mode is compatible with older one-backend workflows, but it will not clean up other backend sets attached to the same pool.
+Prefer `--all-attached-backends` if the pool has multiple load balancer attachments.
 
 ---
 
-## Filter auto-discovered attachments to one load balancer
+## Targeted recovery for one old VM
 
-If the pool has multiple load balancer attachments but you want to handle only one load balancer, combine `--all-attached-backends` with `--lb-id`.
+Use targeted mode when a previous run already created a replacement VM or when you only want to replace one known old pool member.
 
 ```bash
+export OLD_INSTANCE_ID="ocid1.instance.oc1.<region>.<unique_id>"
+
 ./inst-config-update.sh \
   --no-env-file \
-  --new-instance-config-id "ocid1.instanceconfiguration.oc1..example" \
-  --compartment-id "ocid1.compartment.oc1..example" \
-  --instance-pool-id "ocid1.instancepool.oc1..example" \
-  --lb-id "ocid1.loadbalancer.oc1..example" \
+  --new-instance-config-id "$NEW_INSTANCE_CONFIG_ID" \
+  --compartment-id "$COMPARTMENT_ID" \
+  --instance-pool-id "$INSTANCE_POOL_ID" \
   --all-attached-backends \
+  --target-instance-id "$OLD_INSTANCE_ID" \
+  --steady-size 1 \
   --surge-by 1 \
   --drain-seconds 120 \
-  --replacement-method detach \
+  --healthy-consecutive-checks 2 \
   --reset-rollout-state
 ```
 
+Use `--steady-size 1` only if the intended final pool size is actually `1`.
+
+If a previous failed run left the pool already surged, `--steady-size` is important. Without it, the script may treat the current surged pool size as the new desired normal size.
+
 ---
 
-## Resume a failed rollout
+## Cleanup stale load balancer backends only
 
-If a rollout stops halfway, rerun the script **without** `--reset-rollout-state`.
+Use cleanup-only mode when the load balancer has backend entries for VMs that no longer exist or are no longer valid running pool members.
+
+> Only use this mode if the selected backend sets are dedicated to this instance pool. If the backend sets contain manually added non-pool backends, this command may delete them.
 
 ```bash
 ./inst-config-update.sh \
+  --cleanup-stale-backends-only \
+  --delete-orphan-backends true \
   --no-env-file \
-  --new-instance-config-id "ocid1.instanceconfiguration.oc1..example" \
-  --compartment-id "ocid1.compartment.oc1..example" \
-  --instance-pool-id "ocid1.instancepool.oc1..example" \
-  --all-attached-backends \
-  --surge-by 1 \
-  --drain-seconds 120 \
-  --replacement-method detach
+  --compartment-id "$COMPARTMENT_ID" \
+  --instance-pool-id "$INSTANCE_POOL_ID" \
+  --all-attached-backends
 ```
 
-The script will reuse the existing rollout state directory and skip instances already marked as completed.
-
----
-
-## Start a fresh rollout
-
-Use `--reset-rollout-state` when starting a new rollout.
-
-Examples:
+What cleanup-only does:
 
 ```text
-config-v1 -> config-v2: use --reset-rollout-state
-config-v2 -> config-v3: use --reset-rollout-state
-resume failed config-v1 -> config-v2: do not use --reset-rollout-state
-rerun same completed rollout: do not use --reset-rollout-state unless you intentionally want to recycle again
+1. Discover selected backend sets.
+2. Build the list of valid RUNNING pool-member private IPs.
+3. List backends on the selected backend sets.
+4. Delete backend entries whose IP does not belong to a valid RUNNING pool member.
 ```
+
+It does not update the instance pool or replace VMs.
 
 ---
 
-## Optional environment file usage
+## Using an env file
 
-The default behavior is `--no-env-file`. You can optionally use an env file.
+The script can run without an env file:
+
+```bash
+--no-env-file
+```
+
+Or you can provide one:
+
+```bash
+--env-file ./rollout.env
+```
 
 Example `rollout.env`:
 
 ```bash
-NEW_INSTANCE_CONFIG_ID="ocid1.instanceconfiguration.oc1..example"
-COMPARTMENT_ID="ocid1.compartment.oc1..example"
-INSTANCE_POOL_ID="ocid1.instancepool.oc1..example"
+export NEW_INSTANCE_CONFIG_ID="ocid1.instanceconfiguration.oc1.<region>.<unique_id>"
+export COMPARTMENT_ID="ocid1.compartment.oc1..<unique_id>"
+export INSTANCE_POOL_ID="ocid1.instancepool.oc1.<region>.<unique_id>"
 ```
 
-Run:
+Then run:
 
 ```bash
 ./inst-config-update.sh \
   --env-file ./rollout.env \
   --all-attached-backends \
+  --steady-size 1 \
   --surge-by 1 \
-  --drain-seconds 120 \
-  --replacement-method detach \
   --reset-rollout-state
 ```
 
----
-
-## Arguments
-
-### Required for rollout
-
-| Argument | Required | Description |
-|---|---:|---|
-| `--new-instance-config-id <ocid>` | Yes | New instance configuration OCID to apply to the pool. Replacement VMs are created from this configuration. |
-| `--compartment-id <ocid>` | Yes | Compartment OCID used to list pool instances and VNIC attachments. |
-| `--instance-pool-id <ocid>` | Yes | Instance pool OCID to update and roll. |
-
-### Required for cleanup-only mode
-
-| Argument | Required | Description |
-|---|---:|---|
-| `--cleanup-stale-backends-only` | Yes | Runs stale backend cleanup without changing the instance configuration or replacing VMs. |
-| `--compartment-id <ocid>` | Yes | Compartment OCID used to list active pool instances and VNICs. |
-| `--instance-pool-id <ocid>` | Yes | Instance pool whose active members are used as the source of truth. |
-| `--all-attached-backends` or single-backend arguments | Yes | Selects which backend sets to inspect and clean. |
-
-### Load balancer selection
-
-| Argument | Description |
-|---|---|
-| `--all-attached-backends` | Recommended. Reads all `ATTACHED` load balancer attachments from the instance pool and handles every discovered backend set and port. |
-| `--lb-id <ocid>` | In single-backend mode, this is the load balancer OCID. With `--all-attached-backends`, this filters discovered attachments to one load balancer. |
-| `--backend-set-name <name>` | Backend set name for single-backend mode. Use with `--app-port`. |
-| `--app-port <port>` | Backend port for single-backend mode. Use with `--backend-set-name`. |
-
-### Rollout behavior
-
-| Argument | Default | Description |
-|---|---:|---|
-| `--surge-by <n>` | `1` | Temporary extra pool capacity during replacement. Example: pool size `2`, surge-by `1` means temporary target size `3`. |
-| `--drain-seconds <seconds>` | `120` | How long to wait after marking old backends drained before removing the old VM. |
-| `--replacement-method <detach|terminate>` | `detach` | `detach` uses the instance-pool detach API with auto-terminate. `terminate` directly terminates the Compute instance and is only a workaround. |
-| `--delete-stale-backend <true|false>` | `true` | Deletes old backend entries after drain and VM removal. |
-| `--pre-clean-stale-backends <true|false>` | `false` | Runs broad stale backend cleanup before rollout. Use only with dedicated backend sets. |
-| `--post-clean-stale-backends <true|false>` | `false` | Runs broad stale backend cleanup after rollout. Use only with dedicated backend sets. |
-| `--health-wait-attempts <n>` | `80` | Number of polling attempts for backend count and health waits. Most wait loops sleep about 15 seconds between attempts. |
-| `--oci-max-retries <n>` | `8` | Max retries passed to OCI CLI operations that support retries. |
-
-### State and configuration
-
-| Argument | Default | Description |
-|---|---:|---|
-| `--reset-rollout-state` | disabled | Starts fresh by deleting the rollout state directory and recapturing current active pool members. |
-| `--rollout-state-dir <path>` | `./rolling-replace-state` | Local state directory for captured old IDs, done IDs, cached IPs, selected attachments, and warnings. |
-| `--env-file <path>` | none | Sources environment variables from a file before validation. |
-| `--no-env-file` | default | Ignores env files and uses CLI arguments/exported variables only. |
-| `-h`, `--help` | n/a | Shows script help. |
+Do not commit real env files to GitHub.
 
 ---
 
-## Rollout state directory
+## Rollout state and resume behavior
 
-The script stores state in:
+The script stores rollout state in:
 
 ```text
 ./rolling-replace-state
 ```
 
-The directory may contain:
+You can override it:
+
+```bash
+--rollout-state-dir ./my-rollout-state
+```
+
+State files include:
 
 ```text
-old-instance-ids.txt
-  Original active pool members captured at rollout start.
-
-done-instance-ids.txt
-  Instances already replaced.
-
-original-size.txt
-  Original pool target size.
-
 lb-attachments.tsv
-  Selected load balancer/backend-set/port attachments.
-
-instance-private-ips/
-  Cached private IPs for captured instances.
-
-warnings.txt
-  Non-fatal warnings recorded during the run.
-```
----
-
-## Validation commands before rollout
-
-Set variables first:
-
-```bash
-export COMPARTMENT_ID="ocid1.compartment.oc1..example"
-export INSTANCE_POOL_ID="ocid1.instancepool.oc1..example"
+old-targets.tsv
+done-instance-ids.txt
+summary.log
+before-<instance-id>.ids
+after-<instance-id>.ids
+replacement-<instance-id>.ids
 ```
 
-### Check pool size and state
+### Start a fresh rollout
+
+Use:
 
 ```bash
-oci compute-management instance-pool get \
-  --instance-pool-id "$INSTANCE_POOL_ID" \
-  --query 'data.{name:"display-name",size:size,state:"lifecycle-state"}' \
-  --output table
+--reset-rollout-state
 ```
 
-### List pool instances
+This deletes and recreates the rollout state directory, then captures the current rollout targets.
+
+### Resume an interrupted rollout
+
+Do not use `--reset-rollout-state` when resuming, unless you intentionally want to recapture targets.
 
 ```bash
-oci compute-management instance-pool list-instances \
+./inst-config-update.sh \
+  --no-env-file \
+  --new-instance-config-id "$NEW_INSTANCE_CONFIG_ID" \
   --compartment-id "$COMPARTMENT_ID" \
   --instance-pool-id "$INSTANCE_POOL_ID" \
-  --all \
-  --query 'data[].{id:id,name:"display-name",state:"lifecycle-state"}' \
-  --output table
+  --all-attached-backends \
+  --steady-size 1
 ```
 
-### Inspect load balancer attachments on the pool
+The script skips instances already listed in:
 
-```bash
-oci compute-management instance-pool get \
-  --instance-pool-id "$INSTANCE_POOL_ID" \
-  --query 'data."load-balancers"[].{lb:"load-balancer-id",backendSet:"backend-set-name",port:port,state:"lifecycle-state",vnic:"vnic-selection"}' \
-  --output table
+```text
+done-instance-ids.txt
 ```
 
-### Check a backend set health
+---
+
+## Argument reference
+
+| Argument | Required | Description |
+|---|---:|---|
+| `--new-instance-config-id OCID` | Rollout only | New instance configuration to attach to the pool. |
+| `--compartment-id OCID` | Yes | Compartment containing the instance pool instances. |
+| `--instance-pool-id OCID` | Yes | Instance pool to update and roll. |
+| `--all-attached-backends` | Backend selection | Discover all `ATTACHED` load balancer backend sets from the pool. |
+| `--lb-id OCID` | Backend selection | Load balancer OCID for single-backend mode. |
+| `--backend-set-name NAME` | Backend selection | Backend set name for single-backend mode. |
+| `--app-port PORT` | Backend selection | Backend port for single-backend mode. |
+| `--steady-size N` | Recommended | Desired final pool target size. Strongly recommended for recovery. |
+| `--surge-by N` | No | Extra capacity to add before removing each old VM. Default: `1`. |
+| `--drain-seconds N` | No | Seconds to wait after draining old backends. Default: `120`. |
+| `--healthy-consecutive-checks N` | No | Number of consecutive OK checks required for the explicit replacement VM. Default: `2`. |
+| `--replacement-timeout-seconds N` | No | Max seconds to wait for replacement health. Default: `1800`. |
+| `--poll-seconds N` | No | Poll interval. Default: `15`. |
+| `--target-instance-id OCID` | No | Replace only a specific old pool member. Can be repeated. |
+| `--reset-rollout-state` | No | Start a fresh rollout and recapture targets. |
+| `--rollout-state-dir DIR` | No | Local state directory. Default: `./rolling-replace-state`. |
+| `--cleanup-stale-backends-only` | No | Only delete orphan LB backend entries. Does not roll instances. |
+| `--delete-orphan-backends true` | Cleanup only | Required safety flag for cleanup-only deletion. |
+| `--force-replace-current-config true` | No | Also replace instances already created from the new instance config. Default: `false`. |
+| `--preserve-boot-volume true` | No | Preserve old VM boot volumes when terminating. Default: `false`. |
+| `--no-env-file` | No | Do not load variables from an env file. |
+| `--env-file FILE` | No | Load variables from a shell env file. |
+| `--version` | No | Print the script version. |
+| `--help` | No | Print built-in usage help. |
+
+---
+
+## Unsupported options
+
+The v13 script intentionally refuses detach mode:
 
 ```bash
-export LB_ID="ocid1.loadbalancer.oc1..example"
-export BACKEND_SET_NAME="example-backend-set"
-
-oci lb backend-set-health get \
-  --load-balancer-id "$LB_ID" \
-  --backend-set-name "$BACKEND_SET_NAME"
+--replacement-method detach
 ```
 
-### List backend servers
+It exits with an error because this version is specifically designed to avoid the OCI `detachInstance` API path.
+
+These values are accepted only as no-detach/direct-terminate aliases:
 
 ```bash
-oci lb backend list \
-  --load-balancer-id "$LB_ID" \
-  --backend-set-name "$BACKEND_SET_NAME" \
-  --all \
-  --query 'data[].{name:name,ip:"ip-address",port:port,drain:drain,offline:offline,backup:backup,weight:weight}' \
-  --output table
+--replacement-method terminate
+--replacement-method direct-terminate
+--replacement-method no-detach
+```
+
+You usually do not need to pass `--replacement-method` at all.
+
+---
+
+## How the replacement health gate works
+
+The script does not rely only on total backend count or backend-set health.
+
+For each old VM:
+
+```text
+1. Save valid RUNNING pool instance IDs before surge.
+2. Scale the pool to N + surge.
+3. Save valid RUNNING pool instance IDs after surge.
+4. Compute the new replacement instance IDs using before/after diff.
+5. If the diff is empty, fall back to RUNNING instances created from the new instance config that are not old targets.
+6. For those explicit replacement candidates, check every selected backend set.
+7. Require status OK, drain=false, offline=false for all selected backends.
+8. Require that condition for --healthy-consecutive-checks cycles.
+9. Only then drain the old backend.
+```
+
+This prevents the script from draining a healthy old VM just because another unrelated backend is healthy.
+
+---
+
+## Typical output
+
+Successful replacement looks similar to this:
+
+```text
+Rollout summary:
+  script version:       2026-06-17-v13-no-detach-controller
+  steady size:          1
+  surge target size:    2
+  replacement method:   direct compute terminate; detachInstance is never called
+
+Updating pool to new instance configuration...
+
+Replacing old instance: ocid1.instance.oc1.<region>.<old-id> private_ip=<old-private-ip>
+Scaling pool target size from 1 to 2...
+Waiting for at least 2 valid RUNNING pool instance(s)...
+Explicit replacement candidate ID(s) for this cycle:
+  ocid1.instance.oc1.<region>.<new-id>
+Waiting for explicit replacement VM backend health...
+  explicit replacement readiness: total=1 ready=1 bad=0 consecutive_ok=2/2
+Explicit replacement backend readiness passed.
+Replacement is healthy. Old target may be degraded; draining it now if backend exists.
+Waiting 120s for existing connections to drain...
+Directly terminating old pool member...
+Restoring pool target size to steady size 1 after direct termination request...
+Deleting old backend entries from all selected backend sets...
+Verifying replacement candidate(s) still healthy after old removal...
+Completed replacement for ocid1.instance.oc1.<region>.<old-id>
 ```
 
 ---
 
 ## Troubleshooting
 
-### Backend shows `Critical - Connection failed`
+### New VM is `Critical - Connection failed`
+
+The script should refuse to drain/remove the old VM until the explicit replacement backend is `OK`.
+
+Check the new VM directly:
+
+```bash
+curl -i --connect-timeout 3 "http://<new-private-ip>:<port>/health"
+```
+
+Check backend health:
+
+```bash
+oci lb backend-health get \
+  --load-balancer-id "$LB_ID" \
+  --backend-set-name "<backend-set-name>" \
+  --backend-name "<new-private-ip>:<port>"
+```
 
 Common causes:
 
 ```text
-- The VM was terminated but the backend entry still exists.
-- The app is not listening on the expected backend port.
-- NSG/security-list rules block LB-to-backend traffic.
-- The health-check path or port is wrong.
-- The replacement instance did not bootstrap correctly.
+Application is not running on the new VM
+Wrong backend port
+Wrong health check path
+NSG/security list blocks LB-to-backend traffic
+New instance configuration lost metadata/user_data
+New image does not contain the app/service
+Cloud-init failed
+Local firewall blocks the backend port
 ```
 
-First run cleanup-only mode:
+### Old VM was already `Critical` or drained
+
+That is allowed. The script treats old targets as replaceable even if they are already degraded.
+
+The safety check is on the replacement VM, not the old VM.
+
+### Pool target size is wrong after a failed run
+
+Always provide the desired final size:
 
 ```bash
-./inst-config-update.sh \
-  --cleanup-stale-backends-only \
-  --no-env-file \
-  --compartment-id "ocid1.compartment.oc1..example" \
-  --instance-pool-id "ocid1.instancepool.oc1..example" \
-  --all-attached-backends
+--steady-size N
 ```
 
-Then verify backend health again.
+Example:
 
-### Pool target size is small but many instances appear in the pool list
+```bash
+--steady-size 1
+```
 
-The script filters stale/non-active records before rollout. You can manually check what Compute sees:
+This prevents a previously surged pool from being treated as the new normal size.
+
+### Script says there are no rollout targets
+
+This usually means all valid RUNNING pool members already have:
+
+```text
+instance-configuration-id == NEW_INSTANCE_CONFIG_ID
+```
+
+To replace them anyway:
+
+```bash
+--force-replace-current-config true
+```
+
+Use this only when you intentionally want to recycle instances even though they already use the requested config.
+
+### Stale terminated instances still show in the pool
+
+Because the script does not use `detachInstance`, OCI may show historical or stale terminated pool-member records. The script filters those out by checking the real Compute instance state and VNIC state.
+
+Check active valid pool members manually:
 
 ```bash
 for id in $(oci compute-management instance-pool list-instances \
@@ -579,136 +605,128 @@ for id in $(oci compute-management instance-pool list-instances \
   --instance-pool-id "$INSTANCE_POOL_ID" \
   --all \
   --query 'data[].id' \
-  --raw-output)
-do
+  --raw-output); do
   state=$(oci compute instance get \
     --instance-id "$id" \
     --query 'data."lifecycle-state"' \
-    --raw-output 2>/dev/null || echo "NOT_FOUND")
-
+    --raw-output 2>/dev/null || echo NOT_FOUND)
   echo "$id $state"
 done
 ```
 
-If many entries are `NOT_FOUND`, clean stale LB backends first. If ghost pool records remain, open an OCI support request with the affected instance pool OCID and stale instance OCIDs.
+If stale entries persist and affect operations, open an OCI Support Request.
 
-### The script takes a long time
+### Load balancer still shows stale backends
 
-The script waits for several conditions:
-
-```text
-- Pool scale-up to complete.
-- New VMs to exist and have VNIC/private IPs.
-- Backends to register in every selected backend set.
-- Every selected backend set to return OK.
-- The configured drain window for each old VM.
-```
-
-With the default:
-
-```bash
---health-wait-attempts 80
-```
-
-most health/count loops can wait up to about:
-
-```text
-80 attempts x 15 seconds = 20 minutes
-```
-
-Multiple backend sets and repeated health waits can make a rollout long if backends are slow to register or unhealthy.
-
-### Detach fails with OCI `500/InternalError`
-
-The script retries and checks actual state before trying again. If detach keeps failing, it stops and leaves replacement capacity in place instead of continuing unsafely.
-
-Recommended response:
-
-```text
-1. Do not rerun with --reset-rollout-state.
-2. Check whether the old VM is still attached to the pool.
-3. Check backend health.
-4. Retry after OCI service state settles, or open an OCI support request with the opc-request-id.
-```
-
-### Replacement instance never becomes healthy
-
-Check:
-
-```text
-- The new instance configuration uses the expected image.
-- The new instance configuration preserved the backend NSG/security rules.
-- The app listens on every backend port attached to the pool.
-- Health-check paths and ports match the application.
-- Cloud-init/user_data completed successfully.
-- The app is ready before the health check marks the backend OK.
-```
-
----
-
-## What this script does not do
-
-This script does not:
-
-```text
-- Create a custom image.
-- Create a new instance configuration.
-- Modify NSGs or security lists.
-- Modify load balancer listeners or backend-set health-check settings.
-- Manage Network Load Balancers.
-- Fix OCI service-side ghost pool records that cannot be detached through OCI APIs.
-- Guarantee zero downtime if the app or infrastructure is unhealthy.
-```
-
----
-
-## OCI documentation links
-
-- Updating the instance configuration for an instance pool: <https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/updatinginstancepool-updating-instance-configuration.htm>
-- OCI CLI instance-pool-instance detach: <https://docs.oracle.com/en-us/iaas/tools/oci-cli/3.53.0/oci_cli_docs/cmdref/compute-management/instance-pool-instance/detach.html>
-- OCI CLI instance pool load balancer attachment: <https://docs.oracle.com/en-us/iaas/tools/oci-cli/3.70.0/oci_cli_docs/cmdref/compute-management/instance-pool/attach-lb.html>
-- OCI Load Balancer backend commands: <https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/lb/backend.html>
-
----
-
-## Quick reference
-
-Cleanup stale LB backends:
+Run cleanup-only mode:
 
 ```bash
 ./inst-config-update.sh \
   --cleanup-stale-backends-only \
+  --delete-orphan-backends true \
   --no-env-file \
-  --compartment-id "ocid1.compartment.oc1..example" \
-  --instance-pool-id "ocid1.instancepool.oc1..example" \
+  --compartment-id "$COMPARTMENT_ID" \
+  --instance-pool-id "$INSTANCE_POOL_ID" \
   --all-attached-backends
 ```
 
-Run a fresh rolling update:
+Only use this if the selected backend sets are dedicated to the instance pool.
 
-```bash
-./inst-config-update.sh \
-  --no-env-file \
-  --new-instance-config-id "ocid1.instanceconfiguration.oc1..example" \
-  --compartment-id "ocid1.compartment.oc1..example" \
-  --instance-pool-id "ocid1.instancepool.oc1..example" \
-  --all-attached-backends \
-  --surge-by 1 \
-  --drain-seconds 120 \
-  --replacement-method detach \
-  --reset-rollout-state
+### The script takes a long time
+
+The script waits for real replacement health before removing old capacity. Long runs are usually caused by:
+
+```text
+Replacement VM takes a long time to boot
+Application takes a long time to become ready
+Health checks are slow or failing
+Capacity is not immediately available
+Pool or LB has stale records from earlier failed rollouts
+High drain duration
 ```
 
-Resume an interrupted rollout:
+Tune these values if appropriate:
 
 ```bash
-./inst-config-update.sh \
-  --no-env-file \
-  --new-instance-config-id "ocid1.instanceconfiguration.oc1..example" \
-  --compartment-id "ocid1.compartment.oc1..example" \
-  --instance-pool-id "ocid1.instancepool.oc1..example" \
-  --all-attached-backends \
-  --surge-by 1 \
-  --drain-seconds 120 \
-  --replacement-method detach
+--poll-seconds 10
+--replacement-timeout-seconds 1200
+--healthy-consecutive-checks 2
+--drain-seconds 60
+```
+
+Do not reduce drain time below what your application traffic pattern can safely tolerate.
+
+---
+
+## IAM permissions
+
+The user or dynamic group running the script needs enough permissions to:
+
+```text
+Read and update instance pools
+Read instance configurations
+List and get compute instances
+Terminate compute instances
+List VNIC attachments
+Read VNICs
+Read load balancers and backend sets
+Update load balancer backends
+Delete load balancer backends
+```
+
+The exact policy statements depend on your compartment layout and security model.
+
+---
+
+## Operational checklist
+
+Before running:
+
+```text
+Confirm the new instance configuration launches a working VM.
+Confirm the new VM has the correct NSGs/security lists.
+Confirm the app listens on the backend port.
+Confirm the LB health check path/port/protocol are correct.
+Confirm pool max capacity and service limits allow steady size + surge.
+Confirm backend sets are dedicated to this pool before using cleanup-only mode.
+Decide the correct --steady-size.
+Back up or preserve boot volumes if needed.
+Disable or account for autoscaling policies that may fight manual pool-size changes.
+```
+
+After running:
+
+```bash
+oci compute-management instance-pool get \
+  --instance-pool-id "$INSTANCE_POOL_ID" \
+  --query 'data.{name:"display-name",size:size,state:"lifecycle-state",config:"instance-configuration-id"}' \
+  --output table
+```
+
+Check load balancer backends:
+
+```bash
+oci lb backend list \
+  --load-balancer-id "$LB_ID" \
+  --backend-set-name "<backend-set-name>" \
+  --all \
+  --output table
+```
+
+---
+
+## OCI documentation references
+
+- Updating the instance configuration for an instance pool: https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/updatinginstancepool-updating-instance-configuration.htm
+- Creating instance pools: https://docs.oracle.com/en-us/iaas/Content/Compute/Tasks/creatinginstancepool.htm
+- Attaching a load balancer to an instance pool: https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute-management/instance-pool/attach-lb.html
+- Editing load balancer backends and drain behavior: https://docs.oracle.com/en-us/iaas/Content/Balance/Tasks/update_backend_server.htm
+- Terminating compute instances: https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/compute/instance/terminate.html
+
+---
+
+```markdown
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 ```
