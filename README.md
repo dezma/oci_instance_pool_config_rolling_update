@@ -194,7 +194,7 @@ chmod +x ./inst-config-update-v4-multi-lb-safe.sh
 Run this if previous runs left terminated or missing VMs on the load balancer as `Critical - Connection failed`.
 
 ```bash
-./inst-config-update-v4-multi-lb-safe.sh \
+./inst-config-update.sh \
   --cleanup-stale-backends-only \
   --no-env-file \
   --compartment-id "ocid1.compartment.oc1..example" \
@@ -205,7 +205,7 @@ Run this if previous runs left terminated or missing VMs on the load balancer as
 ### 3. Run the rolling update
 
 ```bash
-./inst-config-update-v4-multi-lb-safe.sh \
+./inst-config-update.sh \
   --no-env-file \
   --new-instance-config-id "ocid1.instanceconfiguration.oc1..example" \
   --compartment-id "ocid1.compartment.oc1..example" \
@@ -224,7 +224,7 @@ Run this if previous runs left terminated or missing VMs on the load balancer as
 Use this when the instance pool is attached to multiple backend sets or ports.
 
 ```bash
-./inst-config-update-v4-multi-lb-safe.sh \
+./inst-config-update.sh \
   --no-env-file \
   --new-instance-config-id "ocid1.instanceconfiguration.oc1..example" \
   --compartment-id "ocid1.compartment.oc1..example" \
@@ -253,7 +253,7 @@ The script reads the pool's load balancer attachments and discovers the load bal
 Use cleanup-only mode to remove stale LB backend entries without changing the pool's instance configuration and without replacing VMs.
 
 ```bash
-./inst-config-update-v4-multi-lb-safe.sh \
+./inst-config-update.sh \
   --cleanup-stale-backends-only \
   --no-env-file \
   --compartment-id "ocid1.compartment.oc1..example" \
@@ -297,7 +297,7 @@ Deleted:
 Use this when you intentionally want to handle only one backend set and one backend port.
 
 ```bash
-./inst-config-update-v4-multi-lb-safe.sh \
+./inst-config-update.sh \
   --no-env-file \
   --new-instance-config-id "ocid1.instanceconfiguration.oc1..example" \
   --compartment-id "ocid1.compartment.oc1..example" \
@@ -320,7 +320,7 @@ Single-backend mode is compatible with older one-backend workflows, but it will 
 If the pool has multiple load balancer attachments but you want to handle only one load balancer, combine `--all-attached-backends` with `--lb-id`.
 
 ```bash
-./inst-config-update-v4-multi-lb-safe.sh \
+./inst-config-update.sh \
   --no-env-file \
   --new-instance-config-id "ocid1.instanceconfiguration.oc1..example" \
   --compartment-id "ocid1.compartment.oc1..example" \
@@ -340,7 +340,7 @@ If the pool has multiple load balancer attachments but you want to handle only o
 If a rollout stops halfway, rerun the script **without** `--reset-rollout-state`.
 
 ```bash
-./inst-config-update-v4-multi-lb-safe.sh \
+./inst-config-update.sh \
   --no-env-file \
   --new-instance-config-id "ocid1.instanceconfiguration.oc1..example" \
   --compartment-id "ocid1.compartment.oc1..example" \
@@ -385,7 +385,7 @@ INSTANCE_POOL_ID="ocid1.instancepool.oc1..example"
 Run:
 
 ```bash
-./inst-config-update-v4-multi-lb-safe.sh \
+./inst-config-update.sh \
   --env-file ./rollout.env \
   --all-attached-backends \
   --surge-by 1 \
@@ -559,7 +559,7 @@ Common causes:
 First run cleanup-only mode:
 
 ```bash
-./inst-config-update-v4-multi-lb-safe.sh \
+./inst-config-update.sh \
   --cleanup-stale-backends-only \
   --no-env-file \
   --compartment-id "ocid1.compartment.oc1..example" \
@@ -676,7 +676,7 @@ This script does not:
 Cleanup stale LB backends:
 
 ```bash
-./inst-config-update-v4-multi-lb-safe.sh \
+./inst-config-update.sh \
   --cleanup-stale-backends-only \
   --no-env-file \
   --compartment-id "ocid1.compartment.oc1..example" \
@@ -687,7 +687,7 @@ Cleanup stale LB backends:
 Run a fresh rolling update:
 
 ```bash
-./inst-config-update-v4-multi-lb-safe.sh \
+./inst-config-update.sh \
   --no-env-file \
   --new-instance-config-id "ocid1.instanceconfiguration.oc1..example" \
   --compartment-id "ocid1.compartment.oc1..example" \
@@ -702,7 +702,7 @@ Run a fresh rolling update:
 Resume an interrupted rollout:
 
 ```bash
-./inst-config-update-v4-multi-lb-safe.sh \
+./inst-config-update.sh \
   --no-env-file \
   --new-instance-config-id "ocid1.instanceconfiguration.oc1..example" \
   --compartment-id "ocid1.compartment.oc1..example" \
