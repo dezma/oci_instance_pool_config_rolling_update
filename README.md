@@ -1,6 +1,6 @@
 # OCI Instance Pool Rolling Instance Configuration Update
 
-`inst-config-update-v4-multi-lb-safe.sh` performs a safe rolling replacement of OCI Compute instance pool members after you point the pool at a new instance configuration.
+`inst-config-update.sh ` performs a safe rolling replacement of OCI Compute instance pool members after you point the pool at a new instance configuration.
 
 It is intended for instance pools behind an **OCI Load Balancer**, including pools attached to **multiple backend sets** and backend ports.
 
@@ -186,7 +186,7 @@ Do not use it when resuming a failed or partially completed rollout.
 ### 1. Make the script executable
 
 ```bash
-chmod +x ./inst-config-update-v4-multi-lb-safe.sh
+chmod +x ./inst-config-update.sh 
 ```
 
 ### 2. Optional: clean stale LB backends first
